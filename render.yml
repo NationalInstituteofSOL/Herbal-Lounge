@@ -1,0 +1,25 @@
+# Render Blueprint — deploys DIVINITea as a free HTTPS web service.
+# Render gives you an automatic https://<name>.onrender.com URL.
+#
+# Secret values are NOT stored here. Render will prompt you for the ones
+# marked "sync: false" when you create the service (keeps secrets out of git).
+
+services:
+  - type: web
+    name: divinitea
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: SQUARE_ENVIRONMENT
+        value: production
+      - key: SQUARE_ACCESS_TOKEN     # paste your production token in Render
+        sync: false
+      - key: SQUARE_LOCATION_ID
+        value: LJFZPQRMGC0K6
+      - key: OWNER_EMAIL
+        value: solmansionclub@gmail.com
+      - key: OWNER_PASSWORD          # paste in Render (don't commit it)
+        sync: false
