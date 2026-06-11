@@ -1,0 +1,9 @@
+# secrets — never commit
+.env
+
+# saved orders (contains customer info)
+orders.json
+
+# dependencies
+node_modules/
+npm-debug.log
