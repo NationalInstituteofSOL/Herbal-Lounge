@@ -1,0 +1,170 @@
+/**
+ * DIVINITea — Square backend + owner dashboard API
+ * --------------------------------------------------------------
+ *   STOREFRONT
+ *   POST /create-payment    → charge a card (Square Payments API), save the order
+ *
+ *   OWNER DASHBOARD (login required)
+ *   POST /login             → exchange email+password for a session token
+ *   GET  /orders            → all saved orders (newest first)
+ *   GET  /payouts           → payouts to your bank (Square Payouts API)
+ *   GET  /payouts/:id       → line items for one payout
+ *
+ * Secrets live in .env (never in the browser). Run:
+ *   npm install express cors square dotenv
+ *   node server.js
+ * Then open  http://localhost:4000        (store)
+ *            http://localhost:4000/dashboard.html   (owner)
+ */
+
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const { Client, Environment } = require("square");
+
+const {
+  SQUARE_ACCESS_TOKEN,
+  SQUARE_LOCATION_ID,
+  SQUARE_ENVIRONMENT = "sandbox",
+  OWNER_EMAIL,
+  OWNER_PASSWORD,
+  PORT = 4000,
+} = process.env;
+
+if (!SQUARE_ACCESS_TOKEN || !SQUARE_LOCATION_ID) {
+  console.error("Missing Square credentials in .env. See SETUP.md.");
+  process.exit(1);
+}
+
+const square = new Client({
+  accessToken: SQUARE_ACCESS_TOKEN,
+  environment:
+    SQUARE_ENVIRONMENT === "production" ? Environment.Production : Environment.Sandbox,
+});
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(__dirname)); // serves index.html + dashboard.html
+
+// BigInt-safe JSON (Square money fields are BigInt)
+const json = (res, code, obj) =>
+  res.status(code).type("application/json")
+     .send(JSON.stringify(obj, (_, v) => (typeof v === "bigint" ? Number(v) : v)));
+
+/* ---------- tiny order store (orders.json) ---------- */
+const ORDERS_FILE = path.join(__dirname, "orders.json");
+const readOrders = () => {
+  try { return JSON.parse(fs.readFileSync(ORDERS_FILE, "utf8")); } catch { return []; }
+};
+const saveOrder = (o) => {
+  const all = readOrders();
+  all.unshift(o);
+  fs.writeFileSync(ORDERS_FILE, JSON.stringify(all, null, 2));
+};
+
+/* ---------- simple server-side sessions ---------- */
+const sessions = new Map(); // token -> expiry (ms)
+const TOKEN_TTL = 1000 * 60 * 60 * 8; // 8 hours
+function requireAuth(req, res, next) {
+  const token = (req.headers.authorization || "").replace("Bearer ", "");
+  const exp = sessions.get(token);
+  if (!exp || exp < Date.now()) return json(res, 401, { success: false, error: "Please log in." });
+  next();
+}
+
+app.post("/login", (req, res) => {
+  const { email, password } = req.body || {};
+  const ok =
+    email && password &&
+    email.toLowerCase() === String(OWNER_EMAIL).toLowerCase() &&
+    password === OWNER_PASSWORD;
+  if (!ok) return json(res, 401, { success: false, error: "Incorrect email or password." });
+  const token = crypto.randomUUID();
+  sessions.set(token, Date.now() + TOKEN_TTL);
+  return json(res, 200, { success: true, token, email: OWNER_EMAIL });
+});
+
+/* ---------- 1) Take a payment ---------- */
+app.post("/create-payment", async (req, res) => {
+  try {
+    const { sourceId, amountCents, currency = "USD", order } = req.body;
+    if (!sourceId || !amountCents)
+      return json(res, 400, { success: false, error: "Missing payment token or amount." });
+
+    const orderNumber = order?.number || "DT-" + crypto.randomBytes(3).toString("hex").toUpperCase();
+
+    const { result } = await square.paymentsApi.createPayment({
+      sourceId,
+      idempotencyKey: crypto.randomUUID(),
+      amountMoney: { amount: BigInt(amountCents), currency },
+      locationId: SQUARE_LOCATION_ID,
+      note: `DIVINITea order ${orderNumber} · ${order?.fulfillment || "order"}`,
+      buyerEmailAddress: order?.customer?.email,
+    });
+
+    saveOrder({
+      ...order,
+      number: orderNumber,
+      paymentId: result.payment.id,
+      status: result.payment.status,
+      receiptUrl: result.payment.receiptUrl,
+      paidAt: new Date().toISOString(),
+    });
+
+    return json(res, 200, {
+      success: true,
+      orderNumber,
+      paymentId: result.payment.id,
+      status: result.payment.status,
+      receiptUrl: result.payment.receiptUrl,
+    });
+  } catch (err) {
+    const detail = err?.errors?.[0]?.detail || "Payment could not be processed.";
+    console.error("create-payment error:", err?.errors || err);
+    return json(res, 402, { success: false, error: detail });
+  }
+});
+
+/* ---------- 2) Dashboard data (protected) ---------- */
+app.get("/orders", requireAuth, (req, res) =>
+  json(res, 200, { success: true, orders: readOrders() })
+);
+
+app.get("/payouts", requireAuth, async (req, res) => {
+  try {
+    const { result } = await square.payoutsApi.listPayouts(
+      SQUARE_LOCATION_ID, undefined, req.query.beginTime, req.query.endTime, undefined, 50
+    );
+    const payouts = (result.payouts || []).map((p) => ({
+      id: p.id,
+      status: p.status,
+      amount: Number(p.amountMoney?.amount || 0) / 100,
+      currency: p.amountMoney?.currency,
+      arrivalDate: p.arrivalDate,
+      createdAt: p.createdAt,
+    }));
+    return json(res, 200, { success: true, payouts });
+  } catch (err) {
+    console.error("payouts error:", err?.errors || err);
+    return json(res, 500, { success: false, error: "Could not load payouts." });
+  }
+});
+
+app.get("/payouts/:id", requireAuth, async (req, res) => {
+  try {
+    const { result } = await square.payoutsApi.listPayoutEntries(req.params.id);
+    return json(res, 200, { success: true, entries: result.payoutEntries || [] });
+  } catch (err) {
+    console.error("payout entries error:", err?.errors || err);
+    return json(res, 500, { success: false, error: "Could not load payout detail." });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`DIVINITea running on http://localhost:${PORT}  (${SQUARE_ENVIRONMENT})`);
+  console.log(`Owner dashboard: http://localhost:${PORT}/dashboard.html`);
+});
